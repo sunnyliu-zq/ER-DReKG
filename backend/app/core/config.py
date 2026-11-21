@@ -4,6 +4,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
+_PUBLIC_DEV_COLLAB_SECRET = "dev-only-insecure-collab-secret-change-in-production"
+# Keep in sync with collab_auth._DEV_SECRET. config cannot import collab_auth
+# here without a circular import at module initialization time.
+
 
 class Settings(BaseSettings):
     app_env: str = "development"
@@ -43,4 +47,32 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=PROJECT_ROOT / ".env", extra="ignore")
 
 
+def validate_production_settings(s: Settings) -> None:
+    """Fail fast at startup when production lacks a usable Collab signing key.
+
+    collab_auth._get_secret() already refuses the public development fallback
+    when APP_ENV=production, but only lazily at the first login/verification.
+    This guard runs at import time so every entry point (API server, CLI
+    scripts, seed) fails immediately instead of serving requests. The key
+    value is never printed, logged, or embedded in the error message.
+    """
+    if s.app_env.strip().lower() != "production":
+        return
+    secret = s.collab_secret_key.strip()
+    if not secret:
+        raise RuntimeError(
+            "APP_ENV=production requires a non-empty COLLAB_SECRET_KEY "
+            "(strong random value) in the repository-root .env or the process "
+            "environment. Refusing to start: the public development fallback "
+            "must never sign production tokens."
+        )
+    if secret == _PUBLIC_DEV_COLLAB_SECRET:
+        raise RuntimeError(
+            "APP_ENV=production must not use the public development "
+            "COLLAB_SECRET_KEY. Set a strong random value in the "
+            "repository-root .env or the process environment."
+        )
+
+
 settings = Settings()
+validate_production_settings(settings)

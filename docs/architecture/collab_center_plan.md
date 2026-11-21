@@ -310,9 +310,17 @@ cd ..\frontend; npm run build
 1. 云服务器上后端如何启动（uvicorn 命令、端口、是否 systemd / supervisor 托管）。
 2. 前端 `dist` 由谁托管（Nginx 静态目录 / 后端 StaticFiles / 对象存储），以及 `/api` 反代规则。
 3. 上传目录在服务器上的持久化与备份位置（`data/collab_uploads/` 需要纳入备份）。
-4. `.env` 需新增 `COLLAB_SECRET_KEY`（生产环境填强随机值）。
+4. `.env` 需新增 `COLLAB_SECRET_KEY`（生产环境填强随机值），并显式设置 `APP_ENV=production`（见下方安全部署说明）。
 
 部署时不新增 GitHub 工作流；前端重新构建后发布 `dist`，后端重启进程即可。
+
+### 生产安全配置（Stage Collab-Security-1）
+
+- **Settings 只读取仓库根目录 `.env`**（`backend/app/core/config.py` 中 `env_file=PROJECT_ROOT / ".env"`）。`backend/.env` 不会被加载，`backend/.env.example` 仅是历史模板；生产配置必须写入根目录 `.env` 或进程环境变量。
+- **启动即失败（fail-fast）**：`APP_ENV=production` 且 `COLLAB_SECRET_KEY` 缺失、为空或纯空白时，`validate_production_settings()` 在 `app.core.config` 导入时抛出 `RuntimeError`，API 服务、CLI 脚本、seed 脚本全部拒绝启动，不会进入任何请求服务阶段。
+- **开发回退仅限 development/test**：`collab_auth._DEV_SECRET` 是公开的开发常量，只允许本地开发/测试便利使用；生产路径在启动守卫与 `_get_secret()` 双层拦截下不可达。严禁把该常量填作生产密钥。
+- **密钥卫生**：真实密钥只存放在根目录 `.env`（已被 `.gitignore` 排除）或部署环境变量中；不提交仓库、不打印、不写入日志；启动守卫的错误信息只包含变量名，不包含密钥值。
+- 根目录 `.env.example` 已提供 `APP_ENV` 条目与生产密钥要求注释，部署时复制为 `.env` 后填写强随机值。
 
 ## 10. 风险与注意事项
 
