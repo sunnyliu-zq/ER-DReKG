@@ -12,7 +12,7 @@ from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from sqlalchemy import func, insert, select
+from sqlalchemy import and_, func, insert, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,9 @@ from app.s1_expression import run_limma_microarray, run_rnaseq_edger_voom, run_p
 from app.s1_pathways import COLLECTIONS, pathway_items, pathway_summary
 from app.s1_precomputed import standardize_precomputed_deg
 from app.s2_stability import summarize_condition_stability
+from app.routers.collab import router as collab_router
+from app.interpretation.evidence import EvidenceError, resolve_graph_build as resolve_kg_graph_build
+from app.interpretation.router import router as interpretation_router
 
 
 @asynccontextmanager
@@ -42,6 +45,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="DiseaseGraph Lab API", version="0.1.0", lifespan=lifespan)
 API = "/api/v1"
+app.include_router(collab_router)
+app.include_router(interpretation_router)
 
 
 @app.get("/health")
@@ -533,48 +538,77 @@ def kg06_coverage(project_id: str, offset: int = Query(0, ge=0), limit: int = Qu
     }
 
 
-@app.get(f"{API}/projects/{{project_id}}/kg06/evidence-package/{{pert_id}}", response_model=KG06EvidencePackageOut)
-def kg06_evidence_package(project_id: str, pert_id: str, graph_build_id: str | None = None, db: Session = Depends(get_db)):
-    project = db.get(Project, project_id)
-    if project is None:
-        raise HTTPException(404, "project not found")
-    if settings.graph_source != "neo4j":
-        raise HTTPException(503, "KG06 requires the live Neo4j graph source")
-    build = db.get(GraphBuild, graph_build_id) if graph_build_id else db.scalar(
-        select(GraphBuild).where(GraphBuild.project_id == project_id, GraphBuild.status == "materialized")
-        .order_by(GraphBuild.created_at.desc(), GraphBuild.graph_build_id.desc()).limit(1)
-    )
-    if build is None or build.project_id != project_id or build.status != "materialized":
-        raise HTTPException(404, "materialized GraphBuild not found in this project")
+def _resolve_kg_graph_build_or_http(db: Session, project_id: str, requested_id: str | None):
+    """Resolve exactly one formal Neo4j GraphBuild for KG06/KG07."""
+    try:
+        return resolve_kg_graph_build(db, project_id, requested_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except EvidenceError as error:
+        message = str(error)
+        if "图谱源" in message:
+            raise HTTPException(503, message) from error
+        if "没有已完成" in message:
+            raise HTTPException(404, message) from error
+        raise HTTPException(409, message) from error
+
+
+def _kg06_evidence_package_for_build(
+    db: Session,
+    project: Project,
+    build: GraphBuild,
+    pert_id: str,
+):
+    """Validate the selected build's bundle, then construct one package."""
     bundle_run = db.get(AnalysisRun, build.analysis_run_id)
     relative_bundle_dir = bundle_run.parameters.get("bundle_dir") if bundle_run is not None else None
     if not isinstance(relative_bundle_dir, str):
         raise HTTPException(409, "GraphBuild is missing its GraphBundle path")
     root = Path(__file__).resolve().parents[2]
     bundle_dir = (root / relative_bundle_dir).resolve()
-    project_root = (root / "data" / "processed" / "projects" / project_id).resolve()
+    project_root = (root / "data" / "processed" / "projects" / project.project_id).resolve()
     if not bundle_dir.is_relative_to(project_root):
         raise HTTPException(422, "GraphBundle path is outside the selected project")
+    for filename, expected in build.input_hashes.items():
+        source_file = (bundle_dir / filename).resolve()
+        if source_file.is_relative_to(bundle_dir) and source_file.is_file() and _hash_file(source_file) != expected:
+            raise HTTPException(409, f"GraphBuild input hash mismatch: {filename}")
     try:
-        for filename, expected in build.input_hashes.items():
-            source_file = (bundle_dir / filename).resolve()
-            if source_file.is_relative_to(bundle_dir) and source_file.is_file() and _hash_file(source_file) != expected:
-                raise HTTPException(409, f"GraphBuild input hash mismatch: {filename}")
-        return build_evidence_package(db, project, build, bundle_dir, pert_id)
+        return build_evidence_package(
+            db,
+            project,
+            build,
+            bundle_dir,
+            pert_id,
+            expected_graph_build_id=build.graph_build_id,
+        )
     except LookupError as error:
         raise HTTPException(404, str(error)) from error
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
 
 
+@app.get(f"{API}/projects/{{project_id}}/kg06/evidence-package/{{pert_id}}", response_model=KG06EvidencePackageOut)
+def kg06_evidence_package(project_id: str, pert_id: str, graph_build_id: str | None = None, db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    build = _resolve_kg_graph_build_or_http(db, project_id, graph_build_id)
+    return _kg06_evidence_package_for_build(db, project, build, pert_id)
+
+
 @app.post(f"{API}/projects/{{project_id}}/kg07/interpret/{{pert_id}}")
 def kg07_interpretation(project_id: str, pert_id: str, mode: str = Query("kg_llm", pattern="^(kg_llm|direct_llm|kg_rule)$"), graph_build_id: str | None = None, db: Session = Depends(get_db)):
-    """Generate a cached evidence-grounded interpretation for this project/build."""
-    package = kg06_evidence_package(project_id, pert_id, graph_build_id, db)
+    """Generate an evidence-grounded interpretation for this project/build."""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    build = _resolve_kg_graph_build_or_http(db, project_id, graph_build_id)
+    package = _kg06_evidence_package_for_build(db, project, build, pert_id)
     if mode == "kg_rule":
-        return kg07_rule_template(package)
+        return kg07_rule_template(package, expected_graph_build_id=build.graph_build_id)
     try:
-        return kg07_interpret(package, mode=mode)
+        return kg07_interpret(package, mode=mode, expected_graph_build_id=build.graph_build_id)
     except RuntimeError as error:
         raise HTTPException(503, str(error)) from error
     except (ValueError, KeyError, json.JSONDecodeError) as error:
@@ -977,15 +1011,45 @@ def drug_mechanisms(project_id: str, drug_id: str, db: Session = Depends(get_db)
     return {"project_id": project_id, "graph_build_id": build.graph_build_id if build else None, "pert_id": drug_id, "routes": mechanism_for_pert_id(drug_id, project.slug, build.graph_build_id if build else None, graph_dir), "interpretation": "结果包含公共知识图谱路径，以及药物靶点与本项目 S1 富集通路的证据交汇。它们表示关联和证据共现，不构成因果、治疗效果或 ER+ 特异性机制证明。"}
 
 
+def _graph_build_queryable(build: GraphBuild) -> bool:
+    """Neo4j builds are usable only after a complete import; CSV snapshots remain valid."""
+    if build.graph_source == "neo4j":
+        return build.status == "materialized"
+    return build.status in {"materialized", "materialized_snapshot"}
+
+
+def _mark_graph_build_failed(db: Session, record: GraphBuild, error_message: str) -> None:
+    """Record a failed attempt without downgrading a build another request completed."""
+    db.refresh(record)
+    if record.status == "materialized":
+        return
+    record.status = "failed"
+    record.summary_json = {**(record.summary_json or {}), "neo4j_membership": "failed", "import_error": error_message[-2000:]}
+    db.commit()
+
+
 def _resolve_graph_build(db: Session, project_id: str, requested_id: str | None) -> GraphBuild | None:
     if requested_id:
         build = db.scalar(select(GraphBuild).where(GraphBuild.project_id == project_id, GraphBuild.graph_build_id == requested_id))
         if build is None:
             raise HTTPException(404, "graph build not found in this project")
-    else:
-        build = db.scalar(select(GraphBuild).where(GraphBuild.project_id == project_id).order_by(GraphBuild.created_at.desc(), GraphBuild.graph_build_id.desc()).limit(1))
-    if build and build.status == "failed":
-        raise HTTPException(409, "graph build failed; choose another completed version")
+        if not _graph_build_queryable(build):
+            raise HTTPException(409, "graph build is not complete; choose a materialized version")
+        return build
+    build = db.scalar(
+        select(GraphBuild)
+        .where(
+            GraphBuild.project_id == project_id,
+            or_(
+                and_(GraphBuild.graph_source == "neo4j", GraphBuild.status == "materialized"),
+                and_(GraphBuild.graph_source != "neo4j", GraphBuild.status.in_(["materialized", "materialized_snapshot"])),
+            ),
+        )
+        .order_by(GraphBuild.created_at.desc(), GraphBuild.graph_build_id.desc())
+        .limit(1)
+    )
+    if build is None and settings.graph_source == "neo4j":
+        raise HTTPException(409, "no completed graph build is available for this project")
     return build
 
 
@@ -1154,6 +1218,8 @@ def evidence(evidence_id: str, db: Session = Depends(get_db), graph_build_id: st
     build = db.get(GraphBuild, graph_build_id) if graph_build_id else None
     if graph_build_id and build is None:
         raise HTTPException(404, "graph build not found")
+    if build is not None and not _graph_build_queryable(build):
+        raise HTTPException(409, "graph build is not complete; choose a materialized version")
     if build is not None:
         persisted = db.scalar(select(EvidenceRecord).where(
             EvidenceRecord.graph_build_id == build.graph_build_id,
@@ -1765,7 +1831,7 @@ def graph_build(project_id: str, db: Session = Depends(get_db), bundle_run_id: s
             project_id=project_id,
             analysis_run_id=run.analysis_run_id,
             build_key=build_key,
-            status="materialized_snapshot",
+            status="importing" if settings.graph_source == "neo4j" else "materialized_snapshot",
             graph_source=settings.graph_source,
             input_hashes=hashes,
             summary_json={"snapshot_kind": "已验证项目图谱输入包", "test_only": test_only, "neo4j_importer_sha256": neo4j_importer_sha256},
@@ -1780,28 +1846,35 @@ def graph_build(project_id: str, db: Session = Depends(get_db), bundle_run_id: s
             if record is None:
                 raise
     if settings.graph_source == "neo4j" and record.summary_json.get("neo4j_membership") != "registered":
+        # Mark the build as importing before preflight/subprocess. A crash or a
+        # failed preflight must never leave it queryable as a completed version.
+        if record.status != "importing":
+            record.status = "importing"
+            db.commit()
+            db.refresh(record)
         importer = repo_root / "kg" / "scripts" / "import_phase_b_to_neo4j.py"
         child_env = os.environ.copy()
         child_env.update({"NEO4J_URI": settings.neo4j_uri, "NEO4J_USER": settings.neo4j_user, "NEO4J_PASSWORD": settings.neo4j_password, "NEO4J_DATABASE": settings.neo4j_database})
         kg_python = _resolve_kg_python(repo_root)
         if kg_python is None:
-            record.status = "failed"
-            record.summary_json = {**record.summary_json, "neo4j_membership": "failed", "import_error": "KG Python 环境缺失；需要 BioCypher 的隔离 KG venv"}
-            db.commit()
+            _mark_graph_build_failed(db, record, "KG Python 环境缺失；需要 BioCypher 的隔离 KG venv")
             raise HTTPException(503, "Neo4j 导入所需 KG Python 环境缺失；失败状态已保存")
-        command = [str(kg_python), str(importer), "--graph-build-id", record.graph_build_id, "--subgraph-dir", str(subgraph_dir)]
+        command = [
+            str(kg_python), str(importer),
+            "--graph-build-id", record.graph_build_id,
+            "--subgraph-dir", str(subgraph_dir),
+            "--project-id", project_id,
+            "--build-key", record.build_key,
+            "--expected-input-hashes-json", json.dumps(record.input_hashes, sort_keys=True, separators=(",", ":")),
+        ]
         command.extend(["--pathway-extension-dir", str(extension_dir or (subgraph_dir / "__no_pathway_extension__"))])
         try:
             result = subprocess.run(command, cwd=repo_root, env=child_env, capture_output=True, text=True, timeout=300, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
-            record.status = "failed"
-            record.summary_json = {**record.summary_json, "neo4j_membership": "failed", "import_error": str(error)[:2000]}
-            db.commit()
+            _mark_graph_build_failed(db, record, str(error))
             raise HTTPException(503, "Neo4j 图谱版本导入启动失败或超时；失败状态已保存") from error
         if result.returncode:
-            record.status = "failed"
-            record.summary_json = {**record.summary_json, "neo4j_membership": "failed", "import_error": result.stderr[-2000:]}
-            db.commit()
+            _mark_graph_build_failed(db, record, result.stderr)
             raise HTTPException(503, "Neo4j 图谱版本导入失败；失败信息已写入 GraphBuild 记录")
         record.status = "materialized"
         record.summary_json = {**graph_counts(project.slug, record.graph_build_id), "snapshot_kind": "按 GraphBuild ID 标记的 Neo4j 图谱版本", "neo4j_membership": "registered", "import_status": "PASS", "test_only": test_only, "neo4j_importer_sha256": neo4j_importer_sha256}

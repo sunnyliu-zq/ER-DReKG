@@ -1,8 +1,17 @@
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app import kg06
+
+PHASE_F_PROJECT = SimpleNamespace(
+    slug="erpos-gse42568",
+    project_id="3f18f4c1-713d-58c5-8a53-38eca5a5aaf9",
+)
+PHASE_F_GRAPH_BUILD = "GRAPH_BUILD:3f18f4c1-713d-58c5-8a53-38eca5a5aaf9:a6aabb2147cb5f5e"
 
 
 def make_evidence(evidence_id: str, predicate: str = "TARGETS"):
@@ -72,3 +81,103 @@ def test_kg06_cypher_is_fixed_and_graphbuild_scoped():
         assert "$graph_build_id" in query
         assert "LIMIT " in query
     assert "ProteinTarget" not in kg06.TARGET_QUERY
+
+
+def test_phase_f_graph_build_status_fails_closed_when_manifest_id_missing():
+    assert kg06._phase_f_graph_build_status({}, "GRAPH_BUILD:expected") == (False, "missing_graph_build_id")
+    assert kg06._phase_f_graph_build_status({"graph_build_id": "GRAPH_BUILD:other"}, "GRAPH_BUILD:expected") == (
+        False,
+        "graph_build_mismatch",
+    )
+
+
+def test_phase_f_matching_build_keeps_existing_phase_f_behavior():
+    row, provenance = kg06._read_manifested_phase_f_row(
+        "BRD-K44227013", PHASE_F_PROJECT, PHASE_F_GRAPH_BUILD
+    )
+    assert row is not None
+    assert provenance["available"] is True
+    assert provenance["kg_fields_available"] is True
+    assert provenance["graph_build_matches"] is True
+    assert row["kg_supported_route_count"] == "131"
+    assert row["external_s1_median_rank"] == "3439.0"
+    assert kg06._phase_f_joined_evidence(row, provenance)["kg_supported_route_count"] == "131"
+
+
+def test_phase_f_other_build_isolates_kg_fields_but_keeps_independent_fields():
+    row, provenance = kg06._read_manifested_phase_f_row(
+        "BRD-K44227013",
+        PHASE_F_PROJECT,
+        "GRAPH_BUILD:3f18f4c1-713d-58c5-8a53-38eca5a5aaf9:a08001496a447f7f",
+    )
+    assert row is not None
+    assert provenance["available"] is False
+    assert provenance["kg_fields_available"] is False
+    assert provenance["graph_build_matches"] is False
+    assert provenance["reason"] == "graph_build_mismatch"
+    assert provenance["independent_fields_retained"] is True
+    assert provenance["kg_derived_fields_isolated"] is True
+    assert all(not key.startswith("kg_") for key in row)
+    assert row["external_s1_median_rank"] == "3439.0"
+    assert "kg_supported_route_count" not in row
+    assert kg06._phase_f_joined_evidence(row, provenance) == {
+        "available": False,
+        "reason": "graph_build_mismatch",
+    }
+
+
+def test_phase_f_missing_manifest_graph_build_id_fails_closed(monkeypatch):
+    manifest = {
+        "status": "PASS",
+        "project_id": PHASE_F_PROJECT.project_id,
+        "output_sha256": {
+            "experiments/phase_f_integrated_evidence/candidate_evidence_with_kg.csv": "expected"
+        },
+    }
+    monkeypatch.setattr(kg06, "json", SimpleNamespace(loads=lambda *_: manifest))
+    monkeypatch.setattr(kg06, "sha256_file", lambda *_: "expected")
+    row, provenance = kg06._read_manifested_phase_f_row(
+        "BRD-K44227013", PHASE_F_PROJECT, "GRAPH_BUILD:expected"
+    )
+    assert row is not None
+    assert provenance["available"] is False
+    assert provenance["reason"] == "missing_graph_build_id"
+    assert all(not key.startswith("kg_") for key in row)
+    assert row["external_s1_median_rank"] == "3439.0"
+
+
+def test_phase_f_sha_mismatch_still_fails_closed(monkeypatch):
+    monkeypatch.setattr(kg06, "sha256_file", lambda *_: "bad-sha")
+    row, provenance = kg06._read_manifested_phase_f_row(
+        "BRD-K44227013", PHASE_F_PROJECT, PHASE_F_GRAPH_BUILD
+    )
+    assert row is None
+    assert provenance["available"] is False
+    assert provenance["reason"] == "hash_mismatch"
+
+
+def test_build_evidence_package_rejects_expected_graph_build_mismatch_before_queries():
+    project = SimpleNamespace(project_id="project-a")
+    build = SimpleNamespace(project_id="project-a", status="materialized", graph_source="neo4j", graph_build_id="GRAPH_BUILD:B")
+    with pytest.raises(ValueError, match="expected GraphBuild"):
+        kg06.build_evidence_package(
+            None,
+            project,
+            build,
+            Path("."),
+            "BRD-K44227013",
+            expected_graph_build_id="GRAPH_BUILD:A",
+        )
+
+
+def test_build_evidence_package_rejects_non_neo4j_build_before_queries():
+    project = SimpleNamespace(project_id="project-a")
+    build = SimpleNamespace(project_id="project-a", status="materialized", graph_source="csv", graph_build_id="GRAPH_BUILD:csv")
+    with pytest.raises(ValueError, match="not a Neo4j build"):
+        kg06.build_evidence_package(
+            None,
+            project,
+            build,
+            Path("."),
+            "BRD-K44227013",
+        )

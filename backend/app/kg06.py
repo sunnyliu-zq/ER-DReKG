@@ -113,7 +113,48 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_manifested_phase_f_row(pert_id: str, project: Project) -> tuple[dict | None, dict]:
+PHASE_F_KG_FIELDS = (
+    "mapping_method",
+    "kg_mapping_status",
+    "kg_supported_route_count",
+    "kg_unique_target_gene_count",
+    "kg_unique_pathway_count",
+    "kg_interpretation",
+)
+
+
+def _phase_f_graph_build_status(manifest: dict, expected_graph_build_id: str | None) -> tuple[bool, str | None]:
+    """Return whether Phase F KG-derived fields may be used for this build."""
+    expected = str(expected_graph_build_id).strip() if expected_graph_build_id else ""
+    if not expected:
+        return True, None
+    manifest_build_id = str(manifest.get("graph_build_id") or "").strip()
+    if not manifest_build_id:
+        return False, "missing_graph_build_id"
+    if manifest_build_id != expected:
+        return False, "graph_build_mismatch"
+    return True, None
+
+
+def _without_kg_derived_fields(row: dict) -> dict:
+    """Keep Phase F fields that are not explicitly KG GraphBuild-derived."""
+    return {key: value for key, value in row.items() if not key.startswith("kg_")}
+
+
+def _phase_f_joined_evidence(phase_f: dict | None, provenance: dict) -> dict:
+    if provenance.get("kg_fields_available") is not True:
+        return {
+            "available": False,
+            "reason": provenance.get("reason") or "phase_f_kg_fields_unavailable",
+        }
+    return {key: (phase_f or {}).get(key) for key in PHASE_F_KG_FIELDS}
+
+
+def _read_manifested_phase_f_row(
+    pert_id: str,
+    project: Project,
+    expected_graph_build_id: str | None = None,
+) -> tuple[dict | None, dict]:
     if project.slug != "erpos-gse42568":
         return None, {"available": False, "reason": "No validated Phase F file is registered for this project."}
     root = Path(__file__).resolve().parents[2]
@@ -124,11 +165,63 @@ def _read_manifested_phase_f_row(pert_id: str, project: Project) -> tuple[dict |
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     rel = data_path.relative_to(root).as_posix()
     expected = manifest.get("output_sha256", {}).get(rel)
-    if manifest.get("status") != "PASS" or manifest.get("project_id") != project.project_id or not expected or sha256_file(data_path) != expected:
+    if manifest.get("status") != "PASS" or manifest.get("project_id") != project.project_id or not expected:
         return None, {"available": False, "reason": "Phase F evidence file failed project or SHA-256 validation."}
+
+    graph_build_ok, graph_build_reason = _phase_f_graph_build_status(manifest, expected_graph_build_id)
+    if not graph_build_ok:
+        # A different GraphBuild must not leak its KG-derived columns into this
+        # package.  Independent experiment columns are retained only after the
+        # same manifest, project, and data-hash checks as the normal path.
+        if sha256_file(data_path) != expected:
+            return None, {
+                "available": False,
+                "kg_fields_available": False,
+                "graph_build_matches": False,
+                "reason": "hash_mismatch",
+                "manifest_graph_build_id": manifest.get("graph_build_id"),
+                "expected_graph_build_id": expected_graph_build_id,
+                "source": rel,
+            }
+        with data_path.open(encoding="utf-8-sig", newline="") as stream:
+            row = next((dict(item) for item in csv.DictReader(stream) if item.get("pert_id") == pert_id), None)
+        safe_row = _without_kg_derived_fields(row) if row is not None else None
+        return safe_row, {
+            "available": False,
+            "kg_fields_available": False,
+            "graph_build_matches": False,
+            "reason": graph_build_reason,
+            "manifest_graph_build_id": manifest.get("graph_build_id"),
+            "expected_graph_build_id": expected_graph_build_id,
+            "independent_fields_retained": bool(safe_row),
+            "kg_derived_fields_isolated": True,
+            "manifest_sha256": sha256_file(manifest_path),
+            "data_sha256": expected,
+            "source": rel,
+        }
+
+    if sha256_file(data_path) != expected:
+        return None, {
+            "available": False,
+            "kg_fields_available": False,
+            "graph_build_matches": graph_build_ok,
+            "reason": "hash_mismatch",
+            "manifest_graph_build_id": manifest.get("graph_build_id"),
+            "expected_graph_build_id": expected_graph_build_id,
+            "source": rel,
+        }
     with data_path.open(encoding="utf-8-sig", newline="") as stream:
         row = next((dict(item) for item in csv.DictReader(stream) if item.get("pert_id") == pert_id), None)
-    return row, {"available": row is not None, "manifest_sha256": sha256_file(manifest_path), "data_sha256": expected, "manifest_graph_build_id": manifest.get("graph_build_id"), "source": rel}
+    return row, {
+        "available": row is not None,
+        "kg_fields_available": row is not None,
+        "graph_build_matches": graph_build_ok,
+        "manifest_sha256": sha256_file(manifest_path),
+        "data_sha256": expected,
+        "manifest_graph_build_id": manifest.get("graph_build_id"),
+        "expected_graph_build_id": expected_graph_build_id,
+        "source": rel,
+    }
 
 
 def _load_exp006_row(pert_id: str, project: Project) -> tuple[dict | None, dict]:
@@ -250,12 +343,25 @@ def build_evidence_package(
     build: GraphBuild,
     bundle_dir: Path,
     pert_id: str,
+    expected_graph_build_id: str | None = None,
 ) -> dict:
     """Build a project-, GraphBuild-, and AnalysisRun-scoped EvidencePackage."""
     if not pert_id.strip() or len(pert_id) > 100:
         raise ValueError("invalid perturbagen ID")
     if build.project_id != project.project_id or build.status != "materialized":
         raise ValueError("GraphBuild is not a materialized build in this project")
+    if build.graph_source != "neo4j":
+        raise ValueError("GraphBuild is not a Neo4j build")
+    expected = (
+        str(expected_graph_build_id).strip()
+        if expected_graph_build_id
+        else str(build.graph_build_id).strip()
+    )
+    if expected and build.graph_build_id != expected:
+        raise ValueError(
+            "GraphBuild does not match the expected GraphBuild: "
+            f"build={build.graph_build_id or '<missing>'} expected={expected}"
+        )
     bundle_run = db.get(AnalysisRun, build.analysis_run_id)
     if bundle_run is None or bundle_run.project_id != project.project_id or bundle_run.run_type != "kg_graph_bundle" or bundle_run.status != "completed":
         raise ValueError("GraphBuild has no completed project GraphBundle run")
@@ -282,7 +388,9 @@ def build_evidence_package(
         S2ConditionResult.pert_id == pert_id,
     ).order_by(S2ConditionResult.condition_key)))
 
-    phase_f, phase_f_provenance = _read_manifested_phase_f_row(pert_id, project)
+    phase_f, phase_f_provenance = _read_manifested_phase_f_row(
+        pert_id, project, build.graph_build_id
+    )
     exp006, exp006_provenance = _load_exp006_row(pert_id, project)
     driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
     params = {"project_slug": project.slug, "pert_id": pert_id, "graph_build_id": build.graph_build_id}
@@ -350,6 +458,12 @@ def build_evidence_package(
         gaps.append("one or more path evidence references are absent from this GraphBuild's PostgreSQL EvidenceRecord store")
     if any(not source.get("source_url") for path in paths for edge in path["edges"] for source in edge["sources"] if source.get("verified_in_postgres")):
         gaps.append("some source records have no source URL in the upstream assertion; source_record_id and source_release are retained")
+    if phase_f_provenance.get("kg_derived_fields_isolated"):
+        gaps.append(
+            "Phase F KG-derived fields were isolated because the Phase F manifest GraphBuild "
+            f"({phase_f_provenance.get('manifest_graph_build_id') or '<missing>'}) does not match "
+            f"this package GraphBuild ({build.graph_build_id}); independent experiment fields were retained."
+        )
 
     phase_f_by_pert = phase_f or {}
     persisted_condition_by_key = {row.condition_key: row.condition_json for row in conditions}
@@ -386,10 +500,9 @@ def build_evidence_package(
                 "sensitivity_rank_mcf7", "PRISM_endpoint", "WTCS_PRISM_agreement_interpretation",
             ]
         } if phase_f else {"available": False},
-        "phase_f_joined_evidence": {
-            key: phase_f_by_pert.get(key)
-            for key in ["mapping_method", "kg_mapping_status", "kg_supported_route_count", "kg_unique_target_gene_count", "kg_unique_pathway_count", "kg_interpretation"]
-        } if phase_f else {"available": False},
+        "phase_f_joined_evidence": _phase_f_joined_evidence(
+            phase_f, phase_f_provenance
+        ),
     }
     evidence_input = {
         "project_id": project.project_id,

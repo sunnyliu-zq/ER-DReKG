@@ -11,8 +11,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.bootstrap import seed_historical_project
 from app.db import Base, get_db
-from app.main import app as fastapi_app, _persist_graph_evidence_records, _persist_disease_contexts, candidates, compare_project_runs, create_project, create_study, drug_mechanisms, evidence, graph_build, graph_search, graph_summary, import_project_s2, job_status, link_dataset_to_study, list_datasets, list_graph_builds, list_projects, list_runs, list_studies, project_s2_conditions, project_s2_stability, register_dataset, run_precomputed_s1, run_project_s2, run_project_pathway_enrichment, s1_external_validation, s1_genes, s1_pathways, s1_summary, s1_volcano, s2_candidate_evidence, s2_evidence_matrix, subgraph, _graph_build_inputs, _graph_bundle_dir_for_build
-from app.models import AnalysisRun, Dataset, DiseaseContext, EvidenceRecord, GraphBuild, Project, S2ConditionResult, Study
+from app.main import app as fastapi_app, _persist_graph_evidence_records, _persist_disease_contexts, _resolve_graph_build, _graph_build_queryable, _mark_graph_build_failed, candidates, compare_project_runs, create_project, create_study, drug_mechanisms, evidence, graph_build, graph_search, graph_summary, import_project_s2, job_status, link_dataset_to_study, list_datasets, list_graph_builds, list_projects, list_runs, list_studies, project_s2_conditions, project_s2_stability, register_dataset, run_precomputed_s1, run_project_s2, run_project_pathway_enrichment, s1_external_validation, s1_genes, s1_pathways, s1_summary, s1_volcano, s2_candidate_evidence, s2_evidence_matrix, subgraph, _graph_build_inputs, _graph_bundle_dir_for_build
+from app.models import AnalysisRun, Dataset, DiseaseContext, EvidenceRecord, GraphBuild, Project, S2ConditionResult
 from app.schemas import DatasetCreate, DatasetStudyLink, PrecomputedS1Request, ProjectCreate, S1EnrichmentRequest, S2ImportRequest, S2RunRequest, StudyCreate
 
 
@@ -367,8 +367,6 @@ def test_s1_enrichment_extension_is_provenanced_and_available_in_project_graph(d
 
 
 def test_project_s1_pathway_enrichment_run_is_scoped_and_queryable(db, tmp_path, monkeypatch):
-    import csv
-    import json
     import hashlib
     from pathlib import Path
     import app.main as main_module
@@ -667,6 +665,107 @@ def test_graph_build_id_is_project_scoped_for_queries(db):
     with pytest.raises(HTTPException) as exc:
         graph_summary(other.project_id, db, build["graph_build_id"])
     assert exc.value.status_code == 404
+
+
+def test_neo4j_graph_build_query_gate_and_status_transitions(db, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from app import main as main_module
+    from app.core.config import settings
+
+    project = create_project(ProjectCreate(slug=f"test-neo4j-gate-{uuid4().hex[:8]}", name="Neo4j 状态门禁", disease_id="MONDO:0000001"), db)
+    run = AnalysisRun(analysis_run_id=f"ANALYSIS_RUN:LEGACY:{uuid4()}", project_id=project.project_id, run_type="legacy_phase_b", status="completed", parameters={}, software_versions={}, input_hashes={})
+    db.add(run); db.flush()
+    materialized_id = f"GRAPH_BUILD:{project.project_id}:materialized"
+    importing_id = f"GRAPH_BUILD:{project.project_id}:importing"
+    failed_id = f"GRAPH_BUILD:{project.project_id}:failed"
+    db.add_all([
+        GraphBuild(graph_build_id=materialized_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="a" * 64, status="materialized", graph_source="neo4j", input_hashes={}, summary_json={}, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        GraphBuild(graph_build_id=importing_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="b" * 64, status="importing", graph_source="neo4j", input_hashes={}, summary_json={}, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        GraphBuild(graph_build_id=failed_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="c" * 64, status="failed", graph_source="neo4j", input_hashes={}, summary_json={}, created_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+    ])
+    db.commit()
+
+    assert _graph_build_queryable(db.get(GraphBuild, materialized_id))
+    assert not _graph_build_queryable(db.get(GraphBuild, importing_id))
+    assert not _graph_build_queryable(db.get(GraphBuild, failed_id))
+    assert _resolve_graph_build(db, project.project_id, None).graph_build_id == materialized_id
+    with pytest.raises(HTTPException) as importing_error:
+        _resolve_graph_build(db, project.project_id, importing_id)
+    assert importing_error.value.status_code == 409
+    with pytest.raises(HTTPException) as failed_error:
+        _resolve_graph_build(db, project.project_id, failed_id)
+    assert failed_error.value.status_code == 409
+
+    monkeypatch.setattr(settings, "graph_source", "neo4j")
+    monkeypatch.setattr(main_module, "_graph_build_inputs", lambda *args, **kwargs: (run, tmp_path, None, {"subgraph_nodes.csv": "a" * 64}, False))
+    monkeypatch.setattr(main_module, "_resolve_kg_python", lambda *_: Path(__import__("sys").executable))
+    monkeypatch.setattr(main_module, "graph_counts", lambda *args, **kwargs: {"node_count": 1, "edge_count": 1, "nodes_by_type": {}, "source": "neo4j"})
+
+    observed = {}
+    def failing_run(*args, **kwargs):
+        observed["status"] = db.scalar(select(GraphBuild).where(GraphBuild.project_id == retry_project.project_id).order_by(GraphBuild.created_at.desc())).status
+        return SimpleNamespace(returncode=1, stdout="", stderr="preflight failed")
+    monkeypatch.setattr(main_module.subprocess, "run", failing_run)
+
+    retry_project = create_project(ProjectCreate(slug=f"test-neo4j-retry-{uuid4().hex[:8]}", name="Neo4j 重试", disease_id="MONDO:0000002"), db)
+    retry_run = AnalysisRun(analysis_run_id=f"ANALYSIS_RUN:LEGACY:{uuid4()}", project_id=retry_project.project_id, run_type="legacy_phase_b", status="completed", parameters={}, software_versions={}, input_hashes={})
+    db.add(retry_run); db.commit()
+    monkeypatch.setattr(main_module, "_graph_build_inputs", lambda *args, **kwargs: (retry_run, tmp_path, None, {"subgraph_nodes.csv": "b" * 64}, False))
+
+    with pytest.raises(HTTPException):
+        graph_build(retry_project.project_id, db)
+    failed_record = db.scalar(select(GraphBuild).where(GraphBuild.project_id == retry_project.project_id))
+    assert failed_record.status == "failed"
+    assert observed["status"] == "importing"
+
+    observed.clear()
+    def succeeding_run(*args, **kwargs):
+        observed["status"] = db.get(GraphBuild, failed_record.graph_build_id).status
+        return SimpleNamespace(returncode=0, stdout='{"status":"PASS"}', stderr="")
+    monkeypatch.setattr(main_module.subprocess, "run", succeeding_run)
+
+    result = graph_build(retry_project.project_id, db)
+    assert result["status"] == "materialized"
+    assert observed["status"] == "importing"
+    assert _resolve_graph_build(db, retry_project.project_id, result["graph_build_id"]).status == "materialized"
+
+
+def test_pending_graph_build_evidence_is_rejected(db):
+    project = create_project(ProjectCreate(slug=f"test-pending-evidence-{uuid4().hex[:8]}", name="待导入证据", disease_id="MONDO:0000001"), db)
+    run = AnalysisRun(analysis_run_id=f"ANALYSIS_RUN:LEGACY:{uuid4()}", project_id=project.project_id, run_type="legacy_phase_b", status="completed", parameters={}, software_versions={}, input_hashes={})
+    db.add(run); db.flush()
+    build_id = f"GRAPH_BUILD:{project.project_id}:pending"
+    db.add(GraphBuild(graph_build_id=build_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="f" * 64, status="importing", graph_source="neo4j", input_hashes={}, summary_json={}))
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        evidence("e" * 64, db, build_id)
+    assert exc.value.status_code == 409
+
+
+def test_failed_retry_does_not_downgrade_an_already_materialized_build(db):
+    project = create_project(ProjectCreate(slug=f"test-no-downgrade-{uuid4().hex[:8]}", name="状态不回退", disease_id="MONDO:0000001"), db)
+    run = AnalysisRun(analysis_run_id=f"ANALYSIS_RUN:LEGACY:{uuid4()}", project_id=project.project_id, run_type="legacy_phase_b", status="completed", parameters={}, software_versions={}, input_hashes={})
+    db.add(run); db.flush()
+    build_id = f"GRAPH_BUILD:{project.project_id}:materialized"
+    build = GraphBuild(graph_build_id=build_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="e" * 64, status="materialized", graph_source="neo4j", input_hashes={}, summary_json={"neo4j_membership": "registered"})
+    db.add(build); db.commit()
+
+    _mark_graph_build_failed(db, build, "late failure from a duplicate request")
+    assert db.get(GraphBuild, build_id).status == "materialized"
+
+
+def test_csv_materialized_snapshot_semantics_are_preserved(db):
+    project = create_project(ProjectCreate(slug=f"test-csv-status-{uuid4().hex[:8]}", name="CSV 状态", disease_id="MONDO:0000001"), db)
+    run = AnalysisRun(analysis_run_id=f"ANALYSIS_RUN:CSV:{uuid4()}", project_id=project.project_id, run_type="kg_graph_bundle", status="completed", parameters={}, software_versions={}, input_hashes={})
+    db.add(run); db.flush()
+    build_id = f"GRAPH_BUILD:{project.project_id}:csv"
+    db.add(GraphBuild(graph_build_id=build_id, project_id=project.project_id, analysis_run_id=run.analysis_run_id, build_key="d" * 64, status="materialized_snapshot", graph_source="csv", input_hashes={}, summary_json={}))
+    db.commit()
+
+    assert _graph_build_queryable(db.get(GraphBuild, build_id))
+    assert _resolve_graph_build(db, project.project_id, build_id).graph_build_id == build_id
 
 
 def test_project_requires_standard_disease_curie():
