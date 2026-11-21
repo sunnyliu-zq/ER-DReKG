@@ -6,6 +6,7 @@ project-scoped copies, manifests, and append-only database records are added.
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import json
@@ -19,13 +20,8 @@ csv.field_size_limit(min(sys.maxsize, 2_147_483_647))
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import select  # noqa: E402
-
-from app.db import SessionLocal  # noqa: E402
-from app.main import app, build_project_graph_bundle, graph_build, run_precomputed_s1  # noqa: E402
-from app.models import AnalysisRun, Dataset, Project  # noqa: E402
-from app.schemas import GraphBundleRequest, PrecomputedS1Request, S1EnrichmentRequest  # noqa: E402
+# 后端依赖（FastAPI/SQLAlchemy/app.*）延迟到非 dry-run 流程再导入，
+# 使 --dry-run 离线预览可在无后端运行环境（未 uv sync、未安装 fastapi）时独立执行。
 
 
 PROJECT_ID = "3f18f4c1-713d-58c5-8a53-38eca5a5aaf9"
@@ -42,6 +38,18 @@ ENRICHMENT_FILES = [
     "gene_mapping_audit.csv", "pathway_gene_links.csv", "go_up.csv", "go_down.csv",
     "reactome_up.csv", "reactome_down.csv", "hallmark_gsea.csv",
 ]
+
+# GraphBuild 契约的 15 列（与 build_project_graph_bundle.py 消费端一致）
+SUMMARY_FIELDS = [
+    "pert_id", "drug_name", "cell_id", "pert_type", "dose", "time", "n_signatures",
+    "WTCS_median", "WTCS_mean", "WTCS_sd", "WTCS_mad", "quality_cc_median",
+    "TAS_median", "replicates_median", "rank_within_condition",
+]
+
+# 来自已归档历史登记报告（experiments/platform_phase_c/formal_erpos_project_linkage.json）。
+# 该 S1 run 已确定登记，A+ 注册复用它，避免重跑 S1 差异分析。
+KNOWN_S1_RUN_ID = "ANALYSIS_RUN:S1_PRECOMPUTED:9ebd6c43-9342-487e-a052-ae901461b58c"
+KNOWN_ENRICHMENT_RUN_ID = "ANALYSIS_RUN:S1_ENRICHMENT:eb409567-e846-4422-ae19-0055937871ea"
 
 
 def sha256(path: Path) -> str:
@@ -66,8 +74,143 @@ def write_csv(path: Path, columns: list[str], rows: list[dict[str, object]]) -> 
         writer.writerows(rows)
 
 
-def main() -> None:
-    for path in [S1_SOURCE, ENRICHMENT_ENV, EXP006_TOP50,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="正式 ER+ 项目历史分析运行登记与 GraphBundle 构建（支持离线 dry-run 预览）",
+    )
+    parser.add_argument("--seed-mode", choices=["historical", "aplus"], default="historical",
+                        help="historical=Exp006 Top50 历史流程（默认）；aplus=A+ 预制备 seed")
+    parser.add_argument("--candidate-seed", type=Path, default=EXP006_TOP50,
+                        help="历史模式候选种子 CSV（默认 Exp006 Top50）")
+    parser.add_argument("--aplus-seed", type=Path, default=None,
+                        help="A+ 模式：预制备 drug_condition_summary.csv（15 契约列，含 quality_cc_median）")
+    parser.add_argument("--aplus-provenance", type=Path, default=None,
+                        help="A+ 模式：seed_provenance.csv（来源追溯）")
+    parser.add_argument("--aplus-master", type=Path, default=None,
+                        help="A+ 模式：candidate_master.csv（候选主集合，仅校验用）")
+    parser.add_argument("--seed-label", type=str, default="Exp006 candidate_drugs_top50.csv",
+                        help="seed 来源标签，写入 qc_summary/报告")
+    parser.add_argument("--expected-candidates", type=int, default=None,
+                        help="期望候选（唯一 pert_id）数；不提供则只校验唯一性，不硬编码 50")
+    parser.add_argument("--expected-conditions", type=int, default=None,
+                        help="期望条件行数；不提供则不校验")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="离线预览：只读输入、计算计划，不写数据库、不写文件、不触发 API")
+    return parser.parse_args()
+
+
+def dry_run_preview(args: argparse.Namespace) -> dict:
+    """离线生成注册预览（只读，不写任何文件、不连数据库）。"""
+    preview: dict = {
+        "dry_run": True, "no_database_write": True, "no_file_write": True,
+        "seed_mode": args.seed_mode, "seed_label": args.seed_label,
+    }
+    if args.seed_mode == "historical":
+        _, seed_rows = read_csv(args.candidate_seed)
+        pert_ids = {row["pert_id"].strip() for row in seed_rows if row.get("pert_id", "").strip()}
+        _, sig_rows = read_csv(S2_SOURCE / "formal_signature_scores.csv")
+        _, cond_rows = read_csv(S2_SOURCE / "formal_drug_condition_ranking.csv")
+        sig_subset = [r for r in sig_rows if r.get("scheme") == "B" and r.get("pert_id") in pert_ids]
+        cond_subset = [r for r in cond_rows if r.get("scheme") == "B" and r.get("pert_id") in pert_ids]
+        candidate_count = len(pert_ids)
+        condition_count = len(cond_subset)
+        signature_count = len(sig_subset)
+        seed_sha = sha256(args.candidate_seed)
+        provenance_sha = None
+        preview["candidate_source"] = str(args.candidate_seed.relative_to(ROOT))
+        preview["signature_subset_count"] = signature_count
+        preview["formal_signature_scores_sha256"] = sha256(S2_SOURCE / "formal_signature_scores.csv")
+        preview["open_issue"] = None
+    elif args.seed_mode == "aplus":
+        if not args.aplus_seed or not args.aplus_seed.is_file():
+            raise FileNotFoundError("A+ 模式需要 --aplus-seed 指向预制备 drug_condition_summary.csv")
+        _, seed_rows = read_csv(args.aplus_seed)
+        if not seed_rows:
+            raise ValueError("A+ seed 为空")
+        cols = list(seed_rows[0].keys())
+        pert_ids = {row["pert_id"].strip() for row in seed_rows if row.get("pert_id", "").strip()}
+        candidate_count = len(pert_ids)
+        condition_count = len(seed_rows)
+        signature_count = None
+        seed_sha = sha256(args.aplus_seed)
+        provenance_sha = sha256(args.aplus_provenance) if args.aplus_provenance and args.aplus_provenance.is_file() else None
+        prov_rows: list[dict] = []
+        if args.aplus_provenance and args.aplus_provenance.is_file():
+            _, prov_rows = read_csv(args.aplus_provenance)
+        master_rows: list[dict] = []
+        if args.aplus_master and args.aplus_master.is_file():
+            _, master_rows = read_csv(args.aplus_master)
+        preview["candidate_source"] = str(args.aplus_seed)
+        preview["provenance_source"] = str(args.aplus_provenance)
+        preview["provenance_rows"] = len(prov_rows)
+        preview["master_rows"] = len(master_rows)
+        preview["master_unique_pert_id"] = len({r["pert_id"] for r in master_rows if r.get("pert_id")})
+        preview["seed_columns"] = cols
+        preview["has_quality_cc_median"] = "quality_cc_median" in cols
+        preview["has_cc_median"] = "CC_median" in cols
+        preview["open_issue"] = (
+            "A+ 模式需另行从 final_signature_scores.csv 派生 signature_scores.csv"
+            "（过滤到 1,032 候选的条件），用于 /s2/import 的 required_outputs 校验；本轮 dry-run 未生成。"
+        )
+        preview["signature_scores_pending"] = True
+    else:
+        raise ValueError(f"未知 seed_mode：{args.seed_mode}")
+
+    preview["candidate_count"] = candidate_count
+    preview["condition_count"] = condition_count
+    preview["candidate_condition_distinct"] = True  # 候选（唯一 pert_id）≠ 条件（逐行记录），不把条件当候选
+    preview["signature_subset_count"] = signature_count
+    preview["seed_sha256"] = seed_sha
+    preview["provenance_sha256"] = provenance_sha
+    preview["checks"] = {
+        "candidates_ok": args.expected_candidates is None or candidate_count == args.expected_candidates,
+        "conditions_ok": args.expected_conditions is None or condition_count == args.expected_conditions,
+        "candidate_pert_id_unique": candidate_count == len(pert_ids),
+    }
+
+    # 确定性 would-be s2_run_id。历史模式忠实复现原公式：
+    #   uuid5(NAMESPACE_URL, PROJECT_ID + s1_run_id + "|" + formal_signature_scores_sha + "|" + candidate_seed_sha)
+    # A+ 模式的 signature_scores.csv 尚未派生，故 run_token 为初步值（标注 preliminary）。
+    if args.seed_mode == "historical":
+        sig_component = preview.get("formal_signature_scores_sha256", "")
+    else:
+        sig_component = "PENDING_signature_scores"
+        preview["run_token_preliminary"] = True
+    run_token = str(uuid5(NAMESPACE_URL, PROJECT_ID + KNOWN_S1_RUN_ID + "|" + sig_component + "|" + (seed_sha or "")))
+    preview["would_be_s2_run_id"] = f"ANALYSIS_RUN:S2_LINCS:{run_token}"
+    preview["would_be_result_dir"] = f"data/processed/projects/{PROJECT_ID}/s2/{run_token}"
+    preview["would_be_files"] = ["signature_scores.csv", "drug_condition_summary.csv", "s1_gene_mapping_audit.csv", "qc_summary.json", "run_manifest.json"]
+    preview["would_be_api_calls"] = [
+        f"POST /api/v1/projects/{PROJECT_ID}/s2/import",
+        f"POST /api/v1/projects/{PROJECT_ID}/graph-bundles",
+        f"POST /api/v1/projects/{PROJECT_ID}/graph-builds",
+    ]
+    preview["reused_s1_run_id"] = KNOWN_S1_RUN_ID
+    preview["reused_enrichment_run_id"] = KNOWN_ENRICHMENT_RUN_ID
+    preview["provenance_traceability"] = "seed_provenance.csv 以 seed_row_number 与 seed 行一一对应，保留 candidate_id/condition_record_id/source_row_number/source_sha256"
+    return preview
+
+
+def main(args: argparse.Namespace) -> None:
+    if args.dry_run:
+        preview = dry_run_preview(args)
+        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        return
+    if args.seed_mode == "aplus":
+        raise NotImplementedError(
+            "A+ 完整注册（含 DB 写入）尚未实现；本轮只支持 --dry-run 离线预览。"
+            "请在确认数据库运行环境后，再补齐 A+ 模式的 signature_scores.csv 派生与注册步骤。"
+        )
+
+    # 非 dry-run 流程才需要后端依赖（数据库/API）。
+    from fastapi.testclient import TestClient  # noqa: E402
+    from sqlalchemy import select  # noqa: E402
+    from app.db import SessionLocal  # noqa: E402
+    from app.main import app, build_project_graph_bundle, graph_build, run_precomputed_s1  # noqa: E402
+    from app.models import AnalysisRun, Dataset, Project  # noqa: E402
+    from app.schemas import GraphBundleRequest, PrecomputedS1Request, S1EnrichmentRequest  # noqa: E402
+
+    for path in [S1_SOURCE, ENRICHMENT_ENV, args.candidate_seed,
                  S2_SOURCE / "formal_signature_scores.csv",
                  S2_SOURCE / "formal_drug_condition_ranking.csv",
                  S2_SOURCE / "gene_mapping_audit.csv",
@@ -82,7 +225,7 @@ def main() -> None:
     source_hashes = {str(path.relative_to(ROOT).as_posix()): sha256(path) for path in [
         S1_SOURCE, ENRICHMENT_ENV, *(S1_ENRICHMENT_SOURCE / name for name in ENRICHMENT_FILES),
         S2_SOURCE / "formal_signature_scores.csv", S2_SOURCE / "formal_drug_condition_ranking.csv",
-        S2_SOURCE / "gene_mapping_audit.csv", S2_SOURCE / "formal_qc_summary.csv", EXP006_TOP50,
+        S2_SOURCE / "gene_mapping_audit.csv", S2_SOURCE / "formal_qc_summary.csv", args.candidate_seed,
     ]}
     started = datetime.now(timezone.utc).isoformat()
     result: dict = {
@@ -254,18 +397,21 @@ def main() -> None:
             "pathway_gene_links_include_ensembl_mapping": True,
         }
 
-        # Import the Exp006 Top 50 as GraphBundle seeds, retaining all scheme-B
+        # Import the candidate seed as GraphBundle seeds, retaining all scheme-B
         # dose-specific conditions for those perturbagens (no best-dose pooling).
-        top50_fields, top50_rows = read_csv(EXP006_TOP50)
-        top_ids = {row["pert_id"].strip() for row in top50_rows if row.get("pert_id", "").strip()}
-        if len(top50_rows) != 50 or len(top_ids) != 50:
-            raise ValueError(f"Exp006 候选种子不是 50 个唯一 perturbagen：rows={len(top50_rows)}, unique={len(top_ids)}")
+        # 候选集合已从硬编码 Exp006 Top50 改为 --candidate-seed 可配置输入。
+        _, seed_rows = read_csv(args.candidate_seed)
+        top_ids = {row["pert_id"].strip() for row in seed_rows if row.get("pert_id", "").strip()}
+        if len(seed_rows) != len(top_ids):
+            raise ValueError(f"候选种子存在重复 pert_id：rows={len(seed_rows)}, unique={len(top_ids)}")
+        if args.expected_candidates is not None and len(top_ids) != args.expected_candidates:
+            raise ValueError(f"候选种子唯一 pert_id 数 {len(top_ids)} 与期望 {args.expected_candidates} 不一致")
         sig_fields, sig_rows = read_csv(S2_SOURCE / "formal_signature_scores.csv")
         cond_fields, cond_rows = read_csv(S2_SOURCE / "formal_drug_condition_ranking.csv")
         sig_subset = [row for row in sig_rows if row.get("scheme") == "B" and row.get("pert_id") in top_ids]
         cond_subset = [row for row in cond_rows if row.get("scheme") == "B" and row.get("pert_id") in top_ids]
-        if len({row.get("pert_id") for row in sig_subset}) != 50 or len({row.get("pert_id") for row in cond_subset}) != 50:
-            raise ValueError("Exp006 Top50 中存在候选未能与正式 S2 scheme-B Signature/条件结果对齐")
+        if len({row.get("pert_id") for row in sig_subset}) != len(top_ids) or len({row.get("pert_id") for row in cond_subset}) != len(top_ids):
+            raise ValueError("候选种子中存在候选未能与正式 S2 scheme-B Signature/条件结果对齐")
         summary_fields = ["pert_id", "drug_name", "cell_id", "pert_type", "dose", "time", "n_signatures",
                           "WTCS_median", "WTCS_mean", "WTCS_sd", "WTCS_mad", "quality_cc_median",
                           "TAS_median", "replicates_median", "rank_within_condition"]
@@ -275,7 +421,7 @@ def main() -> None:
                 **{key: row.get(key, "") for key in summary_fields if key != "rank_within_condition"},
                 "rank_within_condition": row.get("rank_condition", ""),
             })
-        run_token = str(uuid5(NAMESPACE_URL, PROJECT_ID + s1_run_id + "|" + source_hashes["s2_lincs/results/formal_signature_scores.csv"] + "|" + source_hashes["experiments/exp006_ranking_reliability/results/candidate_drugs_top50.csv"]))
+        run_token = str(uuid5(NAMESPACE_URL, PROJECT_ID + s1_run_id + "|" + source_hashes["s2_lincs/results/formal_signature_scores.csv"] + "|" + source_hashes[str(args.candidate_seed.relative_to(ROOT).as_posix())]))
         s2_run_id = f"ANALYSIS_RUN:S2_LINCS:{run_token}"
         result_dir = ROOT / "data" / "processed" / "projects" / PROJECT_ID / "s2" / run_token
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -291,7 +437,7 @@ def main() -> None:
             "project_seed_condition_rows": len(normalized_conditions),
             "scheme": "B", "cell_id": "MCF7", "pert_type": "trt_cp", "time": "24 h",
             "quality_threshold": "distil_cc_q75 >= 0.2",
-            "seed_rule": "Exp006 candidate_drugs_top50.csv: 50 unique perturbagens; retain all scheme-B dose-specific condition rows; no per-drug best-dose selection",
+            "seed_rule": f"{args.seed_label}: {len(top_ids)} unique perturbagens; retain all scheme-B dose-specific condition rows; no per-drug best-dose selection",
             "historical_import": True,
         }
         (result_dir / "qc_summary.json").write_text(json.dumps(qc_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -392,4 +538,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())

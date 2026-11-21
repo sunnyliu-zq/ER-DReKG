@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -142,3 +142,62 @@ class S2ConditionResult(Base):
     condition_key: Mapped[str] = mapped_column(String(500), index=True)
     rank_within_condition: Mapped[float] = mapped_column(Float)
     condition_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CollabMember(Base):
+    """Collaboration-center member. Independent from the research KG data."""
+    __tablename__ = "collab_members"
+    member_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    display_name: Mapped[str] = mapped_column(String(120))
+    role: Mapped[str] = mapped_column(String(20), default="member")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, server_default=func.now())
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CollabPost(Base):
+    """A collaborative explanation entry, linked softly to a candidate drug by (project_id, pert_id)."""
+    __tablename__ = "collab_posts"
+    post_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.project_id", ondelete="CASCADE"), index=True)
+    pert_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(250))
+    summary_text: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    current_version: Mapped[int] = mapped_column(Integer, default=1)
+    author_id: Mapped[str | None] = mapped_column(ForeignKey("collab_members.member_id", ondelete="SET NULL"), nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, server_default=func.now())
+
+
+class CollabPostVersion(Base):
+    """Immutable snapshot of a post at a point in time; history is never overwritten."""
+    __tablename__ = "collab_post_versions"
+    __table_args__ = (UniqueConstraint("post_id", "version"),)
+    version_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    post_id: Mapped[str] = mapped_column(ForeignKey("collab_posts.post_id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(250))
+    summary_text: Mapped[str] = mapped_column(Text, default="")
+    change_note: Mapped[str] = mapped_column(String(500), default="")
+    author_id: Mapped[str | None] = mapped_column(ForeignKey("collab_members.member_id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, server_default=func.now())
+
+
+class CollabAttachment(Base):
+    """Metadata for an uploaded collab file stored under the isolated collab upload directory."""
+    __tablename__ = "collab_attachments"
+    attachment_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    post_id: Mapped[str] = mapped_column(ForeignKey("collab_posts.post_id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_path: Mapped[str] = mapped_column(String(500))
+    ext: Mapped[str] = mapped_column(String(16))
+    mime_type: Mapped[str] = mapped_column(String(100))
+    file_bytes: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    uploaded_by: Mapped[str | None] = mapped_column(ForeignKey("collab_members.member_id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, server_default=func.now())

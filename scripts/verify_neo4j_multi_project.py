@@ -15,7 +15,6 @@ from pathlib import Path
 from uuid import UUID, uuid5
 
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT / "backend")
@@ -107,7 +106,6 @@ def main() -> dict:
     condition_id = f"S2_CONDITION:{project_id}:SOFTWARE_FIXTURE_ONLY"
     sentinel = f"TEST_ONLY_SENTINEL_{project_id[:8]}"
     test_pert_id = f"TEST_ONLY_PERT:{project_id}"
-    build_id = f"GRAPH_BUILD:{project_id}:phasee-multi-project"
     bundle_dir = ROOT / "data" / "processed" / "projects" / project_id / "graph_bundle" / "runs" / "phasee-multi-project"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,6 +135,8 @@ def main() -> dict:
     write_csv(bundle_dir / "subgraph_nodes.csv", node_rows, ["id", "type", "label", "properties_json"])
     write_csv(bundle_dir / "subgraph_edges.csv", edge_rows, ["from", "label", "to", "relation", "undirected", "source_release", "properties_json"])
     output_hashes = {name: hashlib.sha256((bundle_dir / name).read_bytes()).hexdigest() for name in ["subgraph_nodes.csv", "subgraph_edges.csv"]}
+    build_key = hashlib.sha256(json.dumps({"project_id": project_id, "output_hashes": output_hashes}, sort_keys=True).encode()).hexdigest()
+    build_id = f"GRAPH_BUILD:{project_id}:{build_key[:16]}"
     fixture_manifest = {"status": "validated", "project_id": project_id, "test_only": True, "fixture_kind": "software_validation_only", "source_graph_build_id": SOURCE_BUILD_ID, "analysis_run_ids": analysis_ids, "reused_public_ids": [chosen["drug_id"], chosen["gene_id"], chosen["pathway_id"]], "output_hashes": output_hashes}
     (bundle_dir / "bundle_manifest.json").write_text(json.dumps(fixture_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -166,10 +166,9 @@ def main() -> dict:
             else:
                 run.status = run_status
                 run.parameters = params
-        build_key = hashlib.sha256(json.dumps({"project_id": project_id, "output_hashes": output_hashes}, sort_keys=True).encode()).hexdigest()
         build = db.get(GraphBuild, build_id)
         if build is None:
-            build = GraphBuild(graph_build_id=build_id, project_id=project_id, analysis_run_id=analysis_ids["bundle"], build_key=build_key, status="materialized_snapshot", graph_source="neo4j", input_hashes=output_hashes, summary_json={"test_only": True, "fixture_kind": "software_validation_only"})
+            build = GraphBuild(graph_build_id=build_id, project_id=project_id, analysis_run_id=analysis_ids["bundle"], build_key=build_key, status="importing", graph_source="neo4j", input_hashes=output_hashes, summary_json={"test_only": True, "fixture_kind": "software_validation_only"})
             db.add(build)
         elif build.project_id != project_id or build.build_key != build_key:
             raise RuntimeError("GraphBuild ID 与当前 test_only 输入不一致")
@@ -182,7 +181,14 @@ def main() -> dict:
 
     # pydantic-settings 从 .env 读取配置，但 importer 使用 os.environ；仅在子进程内传递，不输出口令。
     os.environ.update({"NEO4J_URI": settings.neo4j_uri, "NEO4J_USER": settings.neo4j_user, "NEO4J_PASSWORD": settings.neo4j_password, "NEO4J_DATABASE": settings.neo4j_database})
-    import_bundle(build_id, bundle_dir, None)
+    import_bundle(
+        build_id,
+        bundle_dir,
+        None,
+        project_id=project_id,
+        build_key=build_key,
+        expected_input_hashes_json=json.dumps(output_hashes, sort_keys=True),
+    )
 
     db = SessionLocal()
     try:

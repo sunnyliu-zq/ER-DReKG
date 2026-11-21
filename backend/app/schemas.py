@@ -228,6 +228,86 @@ class KG06CoverageOut(BaseModel):
     input_hashes: dict
 
 
+class PostCreate(BaseModel):
+    pert_id: str | None = Field(default=None, min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=250)
+    summary_text: str = Field(default="", max_length=20000)
+    change_note: str = Field(default="", max_length=500)
+
+
+class PostUpdate(BaseModel):
+    pert_id: str | None = Field(default=None, min_length=1, max_length=100)
+    title: str | None = Field(default=None, min_length=1, max_length=250)
+    summary_text: str | None = Field(default=None, max_length=20000)
+    change_note: str = Field(default="", max_length=500)
+
+
+class AttachmentOut(BaseModel):
+    attachment_id: str
+    post_id: str
+    kind: str
+    original_filename: str
+    ext: str
+    mime_type: str
+    file_bytes: int
+    sha256: str
+    uploaded_by: str | None = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class VersionOut(BaseModel):
+    version_id: str
+    version: int
+    title: str
+    summary_text: str
+    change_note: str
+    author_id: str | None = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PostSummaryOut(BaseModel):
+    post_id: str
+    project_id: str
+    pert_id: str | None = None
+    title: str
+    current_version: int
+    author_id: str | None = None
+    author_name: str = ""
+    attachment_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class PostDetailOut(PostSummaryOut):
+    summary_text: str
+    attachments: list[AttachmentOut] = Field(default_factory=list)
+    versions: list[VersionOut] = Field(default_factory=list)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class MemberOut(BaseModel):
+    member_id: str
+    username: str
+    display_name: str
+    role: str
+    is_active: bool
+    created_at: datetime
+    last_login_at: datetime | None = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LoginResult(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    member: MemberOut
+
+
 class KG06EvidencePackageOut(BaseModel):
     package_version: str
     package_id: str

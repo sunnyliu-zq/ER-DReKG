@@ -8,6 +8,7 @@
 **/*.sqlite3
 data/raw/uploads/
 data/raw/**
+data/collab_uploads/
 data/optimuskg/**
 
 # Local datasets, extracted matrices, and bulky scientific intermediates
@@ -46,6 +47,7 @@ outputs/tmp/
 experiments/kg07_mechanism_interpretation/cache/
 experiments/kg07_mechanism_interpretation/predictions/
 experiments/kg07_mechanism_interpretation/top50_llm/
+experiments/drug_interpretation_cache/
 
 
 # Local agent tooling
